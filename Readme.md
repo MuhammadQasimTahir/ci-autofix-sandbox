@@ -2,7 +2,6 @@
 
 When a GitHub Actions build fails, an n8n workflow fetches the failing log, trims it to the actual error, and sends it to a Gemini agent. The agent reads the repository's code, works out the root cause, and drafts a minimal fix. The workflow then opens a pull request with a root-cause analysis (RCA) and asks a human in Slack to approve or reject it. **Nothing is merged without that Slack approval.** Every incident is recorded in a Postgres audit table.
 
-
 ---
 
 ## How it works
@@ -56,7 +55,6 @@ n8n/ci-autofix.json              Main workflow (export)
 n8n/ci-autofix-error-alert.json  Error-alert workflow (export)
 scripts/start_n8n.bat            Starts Postgres + n8n + ngrok (Windows; fill in the placeholders)
 sql/create_audit_table.sql       Audit table schema (no data, no secrets)
-.env.example                     The secrets the setup needs (values stay in n8n)
 ```
 
 ## Setup guide
