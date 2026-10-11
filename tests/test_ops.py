@@ -2,7 +2,6 @@ from calc.ops import add, div, average
 import pytest
 
 def test_add():
-    print("API_KEY=sk-test-51Habcdefghijklmnopqrstuvwxyz0123")
     assert add(2, 3) == 5
 
 def test_divide():
