@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS ci_incidents (
+  id               SERIAL PRIMARY KEY,
+  repo             TEXT NOT NULL,
+  run_id           BIGINT NOT NULL,
+  run_url          TEXT,
+  head_sha         TEXT,
+  failed_step      TEXT,
+  error_excerpt    TEXT,
+  root_cause       TEXT,
+  bug_location     TEXT,
+  confidence       TEXT,
+  patch_file       TEXT,
+  branch           TEXT,
+  pr_number        INT,
+  pr_url           TEXT,
+  resolution       TEXT NOT NULL,
+  failed_at        TIMESTAMPTZ,
+  resolved_at      TIMESTAMPTZ,
+  duration_seconds INT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
