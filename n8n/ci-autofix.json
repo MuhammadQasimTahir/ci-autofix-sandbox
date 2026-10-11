@@ -1,0 +1,1752 @@
+{
+  "name": "CI Autofix",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ci-failure",
+        "options": {}
+      },
+      "id": "76535b89-4572-4394-9b82-95b0e0ac4e99",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -544,
+        96
+      ],
+      "webhookId": "e13cd111-d157-4034-958f-8001836bd2a4"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e60ec402-0532-4357-8c53-fee7a8a39c3f",
+              "leftValue": "={{ $json.headers['x-github-event'] }}",
+              "rightValue": "workflow_run",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "f81038a0-926f-4984-a331-aa67b5c3c0a2",
+              "leftValue": "={{ $json.body.action }}",
+              "rightValue": "completed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "036868b8-4217-4a04-b39a-6da0455c2d4b",
+              "leftValue": "={{ $json.body.workflow_run.conclusion }}",
+              "rightValue": "failure",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "e05d000e-f1bd-416d-8bc8-bbed104ca26e",
+              "leftValue": "={{ $json.body.workflow_run.head_branch }}",
+              "rightValue": "autofix/",
+              "operator": {
+                "type": "string",
+                "operation": "notStartsWith"
+              }
+            },
+            {
+              "id": "e2be72a0-8037-48e9-861c-8527375cf4d0",
+              "leftValue": "={{ $json.body.workflow_run.head_commit.message }}",
+              "rightValue": "[autofix]",
+              "operator": {
+                "type": "string",
+                "operation": "notContains"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "263a96ad-63e9-4b0f-9c81-f5312ebd22c6",
+      "name": "Is failed run?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -320,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.body.repository.full_name }}/actions/runs/{{ $json.body.workflow_run.id }}/jobs?filter=latest",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "edae27b5-bb4f-4d21-a22a-c0a32c7bff23",
+      "name": "Get jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -96,
+        -16
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $('Webhook').first().json.body;\nconst run = body.workflow_run;\nconst jobs = $input.first().json.jobs || [];\nconst job = jobs.find(j => j.conclusion === 'failure');\nif (!job) return [];\nconst step = (job.steps || []).find(s => s.conclusion === 'failure');\n\nreturn [{ json: {\n  repo: body.repository.full_name,\n  run_id: run.id,\n  run_url: run.html_url,\n  head_sha: run.head_sha,\n  head_branch: run.head_branch,\n  commit_message: run.head_commit?.message,\n  job_id: job.id,\n  job_name: job.name,\n  failed_step: step?.name ?? 'unknown',\n}}];"
+      },
+      "id": "6ff3b91e-0f2e-4e23-9778-34de08eb6d62",
+      "name": "Find failed job",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        128,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Trim the job log to the failing section and scrub secrets before anything reaches the LLM\nconst meta = { ...$('Find failed job').first().json };\nconst raw = $input.first().json.log || '';\n\n// 1) Strip the timestamp prefix from every line\nconst lines = raw.split('\\n').map(l => l.replace(/^\\d{4}-\\d{2}-\\d{2}T[\\d:.]+Z\\s?/, ''));\n\n// 2) Isolate the step that errored: from its \"##[group]Run\" header to the first ##[error]\nconst errIdx = lines.findIndex(l => l.startsWith('##[error]'));\nconst end = errIdx === -1 ? lines.length : errIdx + 1;\nlet start = 0;\nfor (let i = end - 1; i >= 0; i--) {\n  if (lines[i].startsWith('##[group]Run ')) { start = i; break; }\n}\nlet section = lines.slice(start, end);\n\n// 3) If pytest ran, keep just the FAILURES / ERRORS block through the final summary line\nconst f = section.findIndex(l => /^=+ (FAILURES|ERRORS) =+$/.test(l));\nif (f !== -1) {\n  const e = section.findIndex((l, i) => i > f && /^=+ .* in [\\d.]+s/.test(l));\n  section = section.slice(f, e === -1 ? section.length : e + 1);\n}\n\n// 4) Scrub anything that looks like a secret (done BEFORE truncation)\nconst SECRET_PATTERNS = [\n  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]'],\n  [/\\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}/g, '[REDACTED_GITHUB_TOKEN]'],\n  [/\\bgithub_pat_[A-Za-z0-9_]{20,}/g, '[REDACTED_GITHUB_TOKEN]'],\n  [/\\bxox[abprs]-[A-Za-z0-9-]{10,}/g, '[REDACTED_SLACK_TOKEN]'],\n  [/\\bAIza[0-9A-Za-z_-]{35}/g, '[REDACTED_GOOGLE_KEY]'],\n  [/\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b/g, '[REDACTED_AWS_KEY]'],\n  [/\\bsk-[A-Za-z0-9_-]{20,}/g, '[REDACTED_API_KEY]'],\n  [/\\beyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}/g, '[REDACTED_JWT]'],\n  [/(Bearer\\s+)[A-Za-z0-9._~+\\/-]{16,}=*/gi, '$1[REDACTED]'],\n  [/((?:api[_-]?key|secret|token|password|passwd|pwd|access[_-]?key)[\"']?\\s*[:=]\\s*[\"']?)(?!\\[REDACTED)[^\\s\"',;]{6,}/gi, '$1[REDACTED]'],\n  [/(:\\/\\/[^:\\s\\/@]+:)[^@\\s]+@/g, '$1[REDACTED]@'],\n];\nlet redactions = 0;\nconst scrub = (text) => {\n  let out = String(text ?? '');\n  for (const [re, rep] of SECRET_PATTERNS) {\n    out = out.replace(re, (...m) => {\n      redactions++;\n      return rep.includes('$1') ? rep.replace('$1', typeof m[1] === 'string' ? m[1] : '') : rep;\n    });\n  }\n  return out;\n};\n\nlet failing_log = scrub(section.join('\\n'));\nmeta.commit_message = scrub(meta.commit_message);\n\n// 5) Hard cap so a runaway log can't flood the LLM\nconst MAX = 8000;\nif (failing_log.length > MAX) failing_log = '...[truncated]\\n' + failing_log.slice(-MAX);\n\nreturn [{ json: { ...meta, failing_log, raw_log_lines: lines.length, redactions } }];"
+      },
+      "id": "bbd558cc-9ae8-4355-808c-a8f1c5dd9827",
+      "name": "Trim log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        768,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.repo }}/actions/jobs/{{ $json.job_id }}/logs",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "options": {
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "21f3be74-078d-4a46-b30e-c0ce67498eca",
+      "name": "Get job log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        352,
+        -16
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.headers.location }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "log"
+            }
+          }
+        }
+      },
+      "id": "d0449abf-ff42-4638-89b5-94f24154466b",
+      "name": "Download log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        560,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=A GitHub Actions CI run failed. Diagnose the root cause.\n\nRepo: {{ $json.repo }}\nBranch: {{ $json.head_branch }}\nCommit: {{ $json.head_sha }}\nCommit message: {{ $json.commit_message }}\nFailed job / step: {{ $json.job_name }} / {{ $json.failed_step }}\n\n<failing_log>\n{{ $json.failing_log }}\n</failing_log>",
+        "options": {
+          "systemMessage": "You are a CI failure fixer for a small Python repo.\n\nProcess:\n1. From the log, identify the failing test file and line.\n2. Read that test file with get_file_contents.\n3. Read the source file(s) the test exercises with get_file_contents.\n4. Use list_repo_files if unsure where code lives; use list_recent_commits only if recent changes help explain the failure.\n5. Stop as soon as you are confident.\n\nDiagnosis rules:\n- Base every conclusion on code you actually read with get_file_contents. Commit messages are hints only, never evidence.\n- \"evidence\" must quote the relevant line(s) from the files you read.\n- Decide whether the bug is in the source code or in the test.\n- If a recent commit intentionally changed an API (e.g. renamed a function), update the callers/tests to match. If the source has a logic error, fix the source. Never weaken or delete a test to make it pass.\n\nPatch rules:\n- Change exactly ONE file, with the smallest change that fixes the failure.\n- Express the change as find/replace edits. Each \"find\" must be copied character-for-character from the file as you read it (including indentation) and must appear exactly once in the file; include surrounding text if needed to make it unique.\n- Do not reformat, rename, or touch unrelated lines.\n- If you cannot produce a safe patch, set \"patch\" to null and \"confidence\" to \"low\".\n- Fix only what the failing test requires. Do not add new validation, edge-case handling, error handling or refactors, even if a commit message or code comment suggests it.\n\nRespond ONLY with a JSON object, no markdown fences:\n{\"root_cause\": string, \"file\": string, \"line\": number or null, \"faulty_code\": string, \"bug_location\": \"source\" or \"test\", \"evidence\": string, \"proposed_fix\": string, \"confidence\": \"high\" or \"medium\" or \"low\", \"patch\": {\"file\": string, \"edits\": [{\"find\": string, \"replace\": string}]} or null}",
+          "maxIterations": 8
+        }
+      },
+      "id": "76de773e-46f8-48dc-b418-501578dd2e74",
+      "name": "Diagnose (AI Agent)",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1008,
+        -16
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 5
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "id": "a098222a-999b-4017-a1c1-42984ae3bde1",
+      "name": "Gemini",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        880,
+        320
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "Z3eQELhPlY3snxsc",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "toolDescription": "Get the raw text of one file in the repo at the failing commit. Input: a repo-relative path such as calc/ops.py or tests/test_ops.py.",
+        "url": "=https://api.github.com/repos/{{ $('Trim log').first().json.repo }}/contents/{{ $fromAI('path', 'Repo-relative file path, e.g. calc/ops.py', 'string') }}?ref={{ $('Trim log').first().json.head_sha }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github.raw+json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "2f592b48-9559-42d4-83a1-b939f7559f86",
+      "name": "get_file_contents",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        336
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "toolDescription": "List every file path in the repo at the failing commit. Takes no input. Use it to find where code lives.",
+        "url": "=https://api.github.com/repos/{{ $('Trim log').first().json.repo }}/git/trees/{{ $('Trim log').first().json.head_sha }}?recursive=1",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "714f8e0b-b3bc-47da-9571-268ff4712c17",
+      "name": "list_repo_files",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [
+        1216,
+        336
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "toolDescription": "List the 5 most recent commits on the failing branch (sha, author, message). Takes no input.",
+        "url": "=https://api.github.com/repos/{{ $('Trim log').first().json.repo }}/commits?sha={{ $('Trim log').first().json.head_branch }}&per_page=5",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "df64bffc-a288-4a8b-aa57-c68480db0c10",
+      "name": "list_recent_commits",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.2,
+      "position": [
+        1408,
+        320
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.output || '';\nconst cleaned = raw.replace(/^`{3}(?:json)?\\s*|\\s*`{3}$/g, '').trim();\nlet diagnosis;\ntry { diagnosis = JSON.parse(cleaned); }\ncatch (e) { diagnosis = { parse_error: e.message, raw }; }\n\nreturn [{ json: { ...$('Trim log').first().json, diagnosis } }];"
+      },
+      "id": "207457f9-29b8-4127-a546-47ac79f00bc4",
+      "name": "Parse diagnosis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1376,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate the agent's patch and prepare branch / PR metadata\nconst d = $input.first().json;\nconst dx = d.diagnosis || {};\nconst p = dx.patch;\n\nif (dx.parse_error) throw new Error('Agent output was not valid JSON: ' + String(dx.raw).slice(0, 300));\nif (!p || !p.file || !Array.isArray(p.edits) || p.edits.length === 0) {\n  throw new Error('Agent returned no usable patch. Confidence: ' + dx.confidence);\n}\nif (dx.confidence === 'low') throw new Error('Agent confidence is low - not opening a PR.');\nif (p.edits.length > 5) throw new Error('Patch has ' + p.edits.length + ' edits - too large for an auto-fix.');\n\nconst file = String(p.file).replace(/^\\/+/, '');\nconst stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);\nconst branch = `autofix/run-${d.run_id}-${stamp}`;\n\nconst firstSentence = String(dx.root_cause || 'CI failure').split(/(?<=\\.)\\s/)[0];\nconst shortCause = firstSentence.length > 70 ? firstSentence.slice(0, 67) + '...' : firstSentence;\n\nconst pr_body = [\n  '## 🤖 Automated CI fix',\n  '',\n  `**Failed run:** [#${d.run_id}](${d.run_url}) - job \\`${d.job_name}\\`, step \\`${d.failed_step}\\``,\n  `**Failing commit:** \\`${String(d.head_sha).slice(0, 7)}\\` - ${String(d.commit_message || '').split('\\n')[0]}`,\n  '',\n  '### Root cause',\n  dx.root_cause || '-',\n  '',\n  '### Evidence',\n  dx.evidence || '-',\n  '',\n  '### Fix',\n  `${dx.proposed_fix || '-'}`,\n  '',\n  `**Changed file:** \\`${file}\\` (${p.edits.length} edit${p.edits.length > 1 ? 's' : ''}) | **Bug location:** ${dx.bug_location} | **Confidence:** ${dx.confidence}`,\n  '',\n  '<details><summary>Failing log</summary>',\n  '',\n  '```',\n  d.failing_log || '',\n  '```',\n  '</details>',\n  '',\n  '> Generated by the CI Autofix agent. Review before merging.',\n].join('\\n');\n\nreturn [{ json: {\n  repo: d.repo,\n  base_branch: d.head_branch,\n  run_id: d.run_id,\n  branch,\n  patch: { file, edits: p.edits },\n  commit_message: `fix(ci): ${shortCause}\\n\\nAuto-fix for failed run ${d.run_id}.`,\n  pr_title: `🤖 Autofix: ${shortCause}`,\n  pr_body,\n}}];"
+      },
+      "id": "70063a45-b2ac-41e0-9fd3-451801f2a617",
+      "name": "Prepare fix",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1616,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $json.repo }}/git/ref/heads/{{ $json.base_branch }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "15c2ed9f-b705-4aea-aa38-4f5e2cb5adad",
+      "name": "Get base ref",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1840,
+        -16
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $('Prepare fix').first().json.repo }}/git/refs",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ ref: 'refs/heads/' + $('Prepare fix').first().json.branch, sha: $json.object.sha }) }}",
+        "options": {}
+      },
+      "id": "f38de7ea-2fc7-473b-8ae3-a7ed3b3b1ddd",
+      "name": "Create branch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2064,
+        -16
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $('Prepare fix').first().json.repo }}/contents/{{ $('Prepare fix').first().json.patch.file }}?ref={{ $('Prepare fix').first().json.branch }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1c79c4c1-399a-4b32-a992-5a2a0d68afa7",
+      "name": "Get file (fresh sha)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2288,
+        -16
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Apply find/replace edits to the FRESH file content and re-encode it\nconst fix = $('Prepare fix').first().json;\nconst file = $input.first().json;\n\nlet text = Buffer.from(file.content, 'base64').toString('utf8');\nconst original = text;\n\nfix.patch.edits.forEach((e, i) => {\n  if (typeof e.find !== 'string' || e.find.length === 0) throw new Error(`Edit ${i}: empty \"find\"`);\n  const count = text.split(e.find).length - 1;\n  if (count !== 1) {\n    throw new Error(`Edit ${i}: \"find\" matched ${count} times in ${fix.patch.file} (must be exactly 1). find=${JSON.stringify(e.find)}`);\n  }\n  text = text.replace(e.find, () => (e.replace ?? ''));\n});\n\nif (text === original) throw new Error('Patch made no changes to the file');\n\nreturn [{ json: {\n  path: fix.patch.file,\n  sha: file.sha,               // sha fetched seconds ago from the fix branch\n  content_b64: Buffer.from(text, 'utf8').toString('base64'),\n  message: fix.commit_message,\n  new_content: text,\n}}];"
+      },
+      "id": "d78fedd3-03d8-47a2-b4a5-64479bac14d2",
+      "name": "Apply patch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2496,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.github.com/repos/{{ $('Prepare fix').first().json.repo }}/contents/{{ $json.path }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ message: $json.message, content: $json.content_b64, sha: $json.sha, branch: $('Prepare fix').first().json.branch }) }}",
+        "options": {}
+      },
+      "id": "d4727bcc-614e-4597-8b01-71356e66a20a",
+      "name": "Commit file",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2720,
+        -16
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $('Prepare fix').first().json.repo }}/pulls",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ title: $('Prepare fix').first().json.pr_title, head: $('Prepare fix').first().json.branch, base: $('Prepare fix').first().json.base_branch, body: $('Prepare fix').first().json.pr_body }) }}",
+        "options": {}
+      },
+      "id": "b9d1cd24-11c7-4663-9ab1-038a84615eaa",
+      "name": "Open PR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2944,
+        -16
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "sendAndWait",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "#ci-autofix"
+        },
+        "message": "=:rotating_light: *CI failed* on `{{ $('Prepare fix').first().json.repo }}` (`{{ $('Prepare fix').first().json.base_branch }}`)\n\n*Root cause:* {{ $('Parse diagnosis').first().json.diagnosis.root_cause }}\n*Fix:* {{ $('Parse diagnosis').first().json.diagnosis.proposed_fix }}\n*File:* `{{ $('Prepare fix').first().json.patch.file }}` | *Confidence:* {{ $('Parse diagnosis').first().json.diagnosis.confidence }}\n\n```{{ $('Prepare fix').first().json.patch.edits.map(e => '- ' + e.find + '\\n+ ' + e.replace).join('\\n\\n') }}```\n\n*PR:* <{{ $json.html_url }}|#{{ $json.number }} {{ $json.title }}>\nApprove to squash-merge (CI re-runs on main). Reject to close the PR.",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double",
+            "approveLabel": "Approve & merge",
+            "disapproveLabel": "Reject & close"
+          }
+        },
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "f6c21050-c8f7-48ff-9e7c-e38eb6f73d68",
+      "name": "Slack approval",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        3152,
+        -16
+      ],
+      "webhookId": "d3a1aaaa-0000-4000-8000-0000000000aa",
+      "credentials": {
+        "slackApi": {
+          "id": "xpxcEJdLgg284Lcl",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d3a1c0de-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.data.approved }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "214a9b58-2343-4564-8882-2df826b92e9d",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3376,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://api.github.com/repos/{{ $('Prepare fix').first().json.repo }}/pulls/{{ $('Open PR').first().json.number }}/merge",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ merge_method: 'squash', commit_title: '[autofix] ' + $('Prepare fix').first().json.pr_title + ' (#' + $('Open PR').first().json.number + ')', commit_message: 'Approved via Slack. Fixes CI run ' + $('Prepare fix').first().json.run_id + '.' }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "70efe085-549b-46d5-baa5-2b580cba5156",
+      "name": "Merge PR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3584,
+        -112
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.github.com/repos/{{ $('Prepare fix').first().json.repo }}/pulls/{{ $('Open PR').first().json.number }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ state: 'closed' }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "18599ace-d9b2-4448-9d49-4442ed1a8222",
+      "name": "Close PR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3584,
+        80
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "DELETE",
+        "url": "=https://api.github.com/repos/{{ $('Prepare fix').first().json.repo }}/git/refs/heads/{{ $('Prepare fix').first().json.branch }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            },
+            {
+              "name": "X-GitHub-Api-Version",
+              "value": "2022-11-28"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "06457d5b-11cd-4927-a265-fa40f8eb3eca",
+      "name": "Delete branch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3808,
+        -16
+      ],
+      "credentials": {
+        "githubApi": {
+          "id": "6TmVStSGfdFC3YDm",
+          "name": "GitHub account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// One audit row per incident: error, RCA, resolution, duration\nconst wr = $('Webhook').first().json.body.workflow_run;\nconst fix = $('Prepare fix').first().json;\nconst dx = $('Parse diagnosis').first().json.diagnosis || {};\nconst trim = $('Trim log').first().json;\nconst pr = $('Open PR').first().json;\nconst approved = $('Slack approval').first().json.data?.approved === true;\n\nlet resolution = 'rejected_closed';\nif (approved) {\n  const m = $('Merge PR').first().json;\n  resolution = m.merged === true ? 'approved_merged' : 'approved_merge_failed';\n}\n\nconst failedAt = new Date(wr.updated_at);\nconst resolvedAt = new Date();\n\nreturn [{ json: {\n  repo: fix.repo,\n  run_id: wr.id,\n  run_url: wr.html_url,\n  head_sha: wr.head_sha,\n  failed_step: trim.failed_step,\n  error_excerpt: String(trim.failing_log || '').slice(0, 2000),\n  root_cause: dx.root_cause || null,\n  bug_location: dx.bug_location || null,\n  confidence: dx.confidence || null,\n  patch_file: fix.patch.file,\n  branch: fix.branch,\n  pr_number: pr.number,\n  pr_url: pr.html_url,\n  resolution,\n  failed_at: failedAt.toISOString(),\n  resolved_at: resolvedAt.toISOString(),\n  duration_seconds: Math.round((resolvedAt - failedAt) / 1000),\n}}];"
+      },
+      "id": "cc7f8a74-7997-494b-88e5-27be02869a74",
+      "name": "Build audit row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4032,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "ci_incidents",
+          "mode": "list",
+          "cachedResultName": "ci_incidents"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "id"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "repo",
+              "displayName": "repo",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "run_id",
+              "displayName": "run_id",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "run_url",
+              "displayName": "run_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "head_sha",
+              "displayName": "head_sha",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "failed_step",
+              "displayName": "failed_step",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "error_excerpt",
+              "displayName": "error_excerpt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "root_cause",
+              "displayName": "root_cause",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "bug_location",
+              "displayName": "bug_location",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "patch_file",
+              "displayName": "patch_file",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "branch",
+              "displayName": "branch",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "pr_number",
+              "displayName": "pr_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "pr_url",
+              "displayName": "pr_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "resolution",
+              "displayName": "resolution",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "failed_at",
+              "displayName": "failed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "resolved_at",
+              "displayName": "resolved_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "duration_seconds",
+              "displayName": "duration_seconds",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "c43b634c-f31a-43b4-8a78-2278b39fca7c",
+      "name": "Log incident",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4256,
+        -16
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "BylpNwp4ctIecKsr",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "#ci-autofix"
+        },
+        "text": "={{ { approved_merged: ':white_check_mark: *Merged*', rejected_closed: ':x: *Rejected* - PR closed', approved_merge_failed: ':warning: *Approved but merge failed*' }[$('Build audit row').first().json.resolution] }} <{{ $('Build audit row').first().json.pr_url }}|PR #{{ $('Build audit row').first().json.pr_number }}> - resolved {{ $('Build audit row').first().json.duration_seconds }}s after the CI failure.{{ $('Build audit row').first().json.resolution === 'approved_merged' ? ' CI is re-running on main.' : '' }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "ebbb43c9-dbda-4510-9aed-c19878ed580d",
+      "name": "Notify result",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        4464,
+        -16
+      ],
+      "webhookId": "d3a1bbbb-0000-4000-8000-0000000000bb",
+      "credentials": {
+        "slackApi": {
+          "id": "xpxcEJdLgg284Lcl",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "Webhook": [
+      {
+        "json": {
+          "headers": {
+            "x-github-event": "workflow_run"
+          },
+          "body": {
+            "action": "completed",
+            "workflow_run": {
+              "id": 36238492716,
+              "name": "CI",
+              "node_id": "WFR_kwLOUsnA8M8AAAAIb_uELA",
+              "head_branch": "main",
+              "head_sha": "229d80e6101106222d05592ebdd308241bb85328",
+              "path": ".github/workflows/ci.yml",
+              "display_title": "Rename divide function to div",
+              "run_number": 4,
+              "event": "push",
+              "status": "completed",
+              "conclusion": "failure",
+              "workflow_id": 367601802,
+              "check_suite_id": 98135714516,
+              "check_suite_node_id": "CS_kwDOUsnA8M8AAAAW2Vgq1A",
+              "url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/actions/runs/36238492716",
+              "html_url": "https://github.com/MuhammadQasimTahir/ci-autofix-sandbox/actions/runs/36238492716",
+              "pull_requests": [],
+              "created_at": "2026-09-26T11:20:05Z",
+              "updated_at": "2026-09-26T11:20:16Z",
+              "actor": {
+                "login": "MuhammadQasimTahir",
+                "id": 155317182,
+                "node_id": "U_kgDOCUHzvg",
+                "avatar_url": "https://avatars.githubusercontent.com/u/155317182?v=4",
+                "gravatar_id": "",
+                "url": "https://api.github.com/users/MuhammadQasimTahir",
+                "html_url": "https://github.com/MuhammadQasimTahir",
+                "followers_url": "https://api.github.com/users/MuhammadQasimTahir/followers",
+                "following_url": "https://api.github.com/users/MuhammadQasimTahir/following{/other_user}",
+                "gists_url": "https://api.github.com/users/MuhammadQasimTahir/gists{/gist_id}",
+                "starred_url": "https://api.github.com/users/MuhammadQasimTahir/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/MuhammadQasimTahir/subscriptions",
+                "organizations_url": "https://api.github.com/users/MuhammadQasimTahir/orgs",
+                "repos_url": "https://api.github.com/users/MuhammadQasimTahir/repos",
+                "events_url": "https://api.github.com/users/MuhammadQasimTahir/events{/privacy}",
+                "received_events_url": "https://api.github.com/users/MuhammadQasimTahir/received_events",
+                "type": "User",
+                "user_view_type": "public",
+                "site_admin": false
+              },
+              "run_attempt": 1,
+              "referenced_workflows": [],
+              "run_started_at": "2026-09-26T11:20:05Z",
+              "triggering_actor": {
+                "login": "MuhammadQasimTahir",
+                "id": 155317182,
+                "node_id": "U_kgDOCUHzvg",
+                "avatar_url": "https://avatars.githubusercontent.com/u/155317182?v=4",
+                "gravatar_id": "",
+                "url": "https://api.github.com/users/MuhammadQasimTahir",
+                "html_url": "https://github.com/MuhammadQasimTahir",
+                "followers_url": "https://api.github.com/users/MuhammadQasimTahir/followers",
+                "following_url": "https://api.github.com/users/MuhammadQasimTahir/following{/other_user}",
+                "gists_url": "https://api.github.com/users/MuhammadQasimTahir/gists{/gist_id}",
+                "starred_url": "https://api.github.com/users/MuhammadQasimTahir/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/MuhammadQasimTahir/subscriptions",
+                "organizations_url": "https://api.github.com/users/MuhammadQasimTahir/orgs",
+                "repos_url": "https://api.github.com/users/MuhammadQasimTahir/repos",
+                "events_url": "https://api.github.com/users/MuhammadQasimTahir/events{/privacy}",
+                "received_events_url": "https://api.github.com/users/MuhammadQasimTahir/received_events",
+                "type": "User",
+                "user_view_type": "public",
+                "site_admin": false
+              },
+              "jobs_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/actions/runs/36238492716/jobs",
+              "logs_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/actions/runs/36238492716/logs",
+              "check_suite_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/check-suites/98135714516",
+              "artifacts_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/actions/runs/36238492716/artifacts",
+              "cancel_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/actions/runs/36238492716/cancel",
+              "rerun_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/actions/runs/36238492716/rerun",
+              "previous_attempt_url": null,
+              "workflow_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/actions/workflows/367601802",
+              "head_commit": {
+                "id": "229d80e6101106222d05592ebdd308241bb85328",
+                "tree_id": "0628b7b59ebcc524cc0867e6d22bfe3e9dee0441",
+                "message": "Rename divide function to div",
+                "timestamp": "2026-09-26T11:20:03Z",
+                "author": {
+                  "name": "Muhammad Qasim Tahir",
+                  "email": "155317182+MuhammadQasimTahir@users.noreply.github.com"
+                },
+                "committer": {
+                  "name": "GitHub",
+                  "email": "noreply@github.com"
+                }
+              },
+              "repository": {
+                "id": 1388953840,
+                "node_id": "R_kgDOUsnA8A",
+                "name": "ci-autofix-sandbox",
+                "full_name": "MuhammadQasimTahir/ci-autofix-sandbox",
+                "private": false,
+                "owner": {
+                  "login": "MuhammadQasimTahir",
+                  "id": 155317182,
+                  "node_id": "U_kgDOCUHzvg",
+                  "avatar_url": "https://avatars.githubusercontent.com/u/155317182?v=4",
+                  "gravatar_id": "",
+                  "url": "https://api.github.com/users/MuhammadQasimTahir",
+                  "html_url": "https://github.com/MuhammadQasimTahir",
+                  "followers_url": "https://api.github.com/users/MuhammadQasimTahir/followers",
+                  "following_url": "https://api.github.com/users/MuhammadQasimTahir/following{/other_user}",
+                  "gists_url": "https://api.github.com/users/MuhammadQasimTahir/gists{/gist_id}",
+                  "starred_url": "https://api.github.com/users/MuhammadQasimTahir/starred{/owner}{/repo}",
+                  "subscriptions_url": "https://api.github.com/users/MuhammadQasimTahir/subscriptions",
+                  "organizations_url": "https://api.github.com/users/MuhammadQasimTahir/orgs",
+                  "repos_url": "https://api.github.com/users/MuhammadQasimTahir/repos",
+                  "events_url": "https://api.github.com/users/MuhammadQasimTahir/events{/privacy}",
+                  "received_events_url": "https://api.github.com/users/MuhammadQasimTahir/received_events",
+                  "type": "User",
+                  "user_view_type": "public",
+                  "site_admin": false
+                },
+                "html_url": "https://github.com/MuhammadQasimTahir/ci-autofix-sandbox",
+                "description": null,
+                "fork": false,
+                "url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox",
+                "forks_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/forks",
+                "keys_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/keys{/key_id}",
+                "collaborators_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/collaborators{/collaborator}",
+                "teams_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/teams",
+                "hooks_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/hooks",
+                "issue_events_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/issues/events{/number}",
+                "events_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/events",
+                "assignees_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/assignees{/user}",
+                "branches_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/branches{/branch}",
+                "tags_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/tags",
+                "blobs_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/blobs{/sha}",
+                "git_tags_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/tags{/sha}",
+                "git_refs_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/refs{/sha}",
+                "trees_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/trees{/sha}",
+                "statuses_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/statuses/{sha}",
+                "languages_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/languages",
+                "stargazers_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/stargazers",
+                "contributors_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/contributors",
+                "subscribers_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/subscribers",
+                "subscription_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/subscription",
+                "commits_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/commits{/sha}",
+                "git_commits_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/commits{/sha}",
+                "comments_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/comments{/number}",
+                "issue_comment_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/issues/comments{/number}",
+                "contents_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/contents/{+path}",
+                "compare_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/compare/{base}...{head}",
+                "merges_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/merges",
+                "archive_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/{archive_format}{/ref}",
+                "downloads_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/downloads",
+                "issues_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/issues{/number}",
+                "pulls_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/pulls{/number}",
+                "milestones_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/milestones{/number}",
+                "notifications_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/notifications{?since,all,participating}",
+                "labels_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/labels{/name}",
+                "releases_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/releases{/id}",
+                "deployments_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/deployments"
+              },
+              "head_repository": {
+                "id": 1388953840,
+                "node_id": "R_kgDOUsnA8A",
+                "name": "ci-autofix-sandbox",
+                "full_name": "MuhammadQasimTahir/ci-autofix-sandbox",
+                "private": false,
+                "owner": {
+                  "login": "MuhammadQasimTahir",
+                  "id": 155317182,
+                  "node_id": "U_kgDOCUHzvg",
+                  "avatar_url": "https://avatars.githubusercontent.com/u/155317182?v=4",
+                  "gravatar_id": "",
+                  "url": "https://api.github.com/users/MuhammadQasimTahir",
+                  "html_url": "https://github.com/MuhammadQasimTahir",
+                  "followers_url": "https://api.github.com/users/MuhammadQasimTahir/followers",
+                  "following_url": "https://api.github.com/users/MuhammadQasimTahir/following{/other_user}",
+                  "gists_url": "https://api.github.com/users/MuhammadQasimTahir/gists{/gist_id}",
+                  "starred_url": "https://api.github.com/users/MuhammadQasimTahir/starred{/owner}{/repo}",
+                  "subscriptions_url": "https://api.github.com/users/MuhammadQasimTahir/subscriptions",
+                  "organizations_url": "https://api.github.com/users/MuhammadQasimTahir/orgs",
+                  "repos_url": "https://api.github.com/users/MuhammadQasimTahir/repos",
+                  "events_url": "https://api.github.com/users/MuhammadQasimTahir/events{/privacy}",
+                  "received_events_url": "https://api.github.com/users/MuhammadQasimTahir/received_events",
+                  "type": "User",
+                  "user_view_type": "public",
+                  "site_admin": false
+                },
+                "html_url": "https://github.com/MuhammadQasimTahir/ci-autofix-sandbox",
+                "description": null,
+                "fork": false,
+                "url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox",
+                "forks_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/forks",
+                "keys_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/keys{/key_id}",
+                "collaborators_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/collaborators{/collaborator}",
+                "teams_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/teams",
+                "hooks_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/hooks",
+                "issue_events_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/issues/events{/number}",
+                "events_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/events",
+                "assignees_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/assignees{/user}",
+                "branches_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/branches{/branch}",
+                "tags_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/tags",
+                "blobs_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/blobs{/sha}",
+                "git_tags_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/tags{/sha}",
+                "git_refs_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/refs{/sha}",
+                "trees_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/trees{/sha}",
+                "statuses_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/statuses/{sha}",
+                "languages_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/languages",
+                "stargazers_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/stargazers",
+                "contributors_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/contributors",
+                "subscribers_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/subscribers",
+                "subscription_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/subscription",
+                "commits_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/commits{/sha}",
+                "git_commits_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/commits{/sha}",
+                "comments_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/comments{/number}",
+                "issue_comment_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/issues/comments{/number}",
+                "contents_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/contents/{+path}",
+                "compare_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/compare/{base}...{head}",
+                "merges_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/merges",
+                "archive_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/{archive_format}{/ref}",
+                "downloads_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/downloads",
+                "issues_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/issues{/number}",
+                "pulls_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/pulls{/number}",
+                "milestones_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/milestones{/number}",
+                "notifications_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/notifications{?since,all,participating}",
+                "labels_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/labels{/name}",
+                "releases_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/releases{/id}",
+                "deployments_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/deployments"
+              }
+            },
+            "workflow": {
+              "id": 367601802,
+              "node_id": "W_kwDOUsnA8M4V6SiK",
+              "name": "CI",
+              "path": ".github/workflows/ci.yml",
+              "state": "active",
+              "created_at": "2026-09-26T09:22:16.000Z",
+              "updated_at": "2026-09-26T09:22:16.000Z",
+              "url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/actions/workflows/367601802",
+              "html_url": "https://github.com/MuhammadQasimTahir/ci-autofix-sandbox/blob/main/.github/workflows/ci.yml",
+              "badge_url": "https://github.com/MuhammadQasimTahir/ci-autofix-sandbox/workflows/CI/badge.svg"
+            },
+            "repository": {
+              "id": 1388953840,
+              "node_id": "R_kgDOUsnA8A",
+              "name": "ci-autofix-sandbox",
+              "full_name": "MuhammadQasimTahir/ci-autofix-sandbox",
+              "private": false,
+              "owner": {
+                "login": "MuhammadQasimTahir",
+                "id": 155317182,
+                "node_id": "U_kgDOCUHzvg",
+                "avatar_url": "https://avatars.githubusercontent.com/u/155317182?v=4",
+                "gravatar_id": "",
+                "url": "https://api.github.com/users/MuhammadQasimTahir",
+                "html_url": "https://github.com/MuhammadQasimTahir",
+                "followers_url": "https://api.github.com/users/MuhammadQasimTahir/followers",
+                "following_url": "https://api.github.com/users/MuhammadQasimTahir/following{/other_user}",
+                "gists_url": "https://api.github.com/users/MuhammadQasimTahir/gists{/gist_id}",
+                "starred_url": "https://api.github.com/users/MuhammadQasimTahir/starred{/owner}{/repo}",
+                "subscriptions_url": "https://api.github.com/users/MuhammadQasimTahir/subscriptions",
+                "organizations_url": "https://api.github.com/users/MuhammadQasimTahir/orgs",
+                "repos_url": "https://api.github.com/users/MuhammadQasimTahir/repos",
+                "events_url": "https://api.github.com/users/MuhammadQasimTahir/events{/privacy}",
+                "received_events_url": "https://api.github.com/users/MuhammadQasimTahir/received_events",
+                "type": "User",
+                "user_view_type": "public",
+                "site_admin": false
+              },
+              "html_url": "https://github.com/MuhammadQasimTahir/ci-autofix-sandbox",
+              "description": null,
+              "fork": false,
+              "url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox",
+              "forks_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/forks",
+              "keys_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/keys{/key_id}",
+              "collaborators_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/collaborators{/collaborator}",
+              "teams_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/teams",
+              "hooks_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/hooks",
+              "issue_events_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/issues/events{/number}",
+              "events_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/events",
+              "assignees_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/assignees{/user}",
+              "branches_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/branches{/branch}",
+              "tags_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/tags",
+              "blobs_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/blobs{/sha}",
+              "git_tags_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/tags{/sha}",
+              "git_refs_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/refs{/sha}",
+              "trees_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/trees{/sha}",
+              "statuses_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/statuses/{sha}",
+              "languages_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/languages",
+              "stargazers_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/stargazers",
+              "contributors_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/contributors",
+              "subscribers_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/subscribers",
+              "subscription_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/subscription",
+              "commits_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/commits{/sha}",
+              "git_commits_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/git/commits{/sha}",
+              "comments_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/comments{/number}",
+              "issue_comment_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/issues/comments{/number}",
+              "contents_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/contents/{+path}",
+              "compare_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/compare/{base}...{head}",
+              "merges_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/merges",
+              "archive_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/{archive_format}{/ref}",
+              "downloads_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/downloads",
+              "issues_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/issues{/number}",
+              "pulls_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/pulls{/number}",
+              "milestones_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/milestones{/number}",
+              "notifications_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/notifications{?since,all,participating}",
+              "labels_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/labels{/name}",
+              "releases_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/releases{/id}",
+              "deployments_url": "https://api.github.com/repos/MuhammadQasimTahir/ci-autofix-sandbox/deployments",
+              "created_at": "2026-09-26T09:16:54Z",
+              "updated_at": "2026-09-26T11:20:06Z",
+              "pushed_at": "2026-09-26T11:20:03Z",
+              "git_url": "git://github.com/MuhammadQasimTahir/ci-autofix-sandbox.git",
+              "ssh_url": "git@github.com:MuhammadQasimTahir/ci-autofix-sandbox.git",
+              "clone_url": "https://github.com/MuhammadQasimTahir/ci-autofix-sandbox.git",
+              "svn_url": "https://github.com/MuhammadQasimTahir/ci-autofix-sandbox",
+              "homepage": null,
+              "size": 5,
+              "stargazers_count": 0,
+              "watchers_count": 0,
+              "language": "Python",
+              "has_issues": true,
+              "has_projects": true,
+              "has_downloads": false,
+              "has_wiki": true,
+              "has_pages": false,
+              "has_discussions": false,
+              "forks_count": 0,
+              "mirror_url": null,
+              "archived": false,
+              "disabled": false,
+              "open_issues_count": 0,
+              "license": null,
+              "allow_forking": true,
+              "is_template": false,
+              "web_commit_signoff_required": false,
+              "has_pull_requests": true,
+              "pull_request_creation_policy": "all",
+              "topics": [],
+              "visibility": "public",
+              "forks": 0,
+              "open_issues": 0,
+              "watchers": 0,
+              "default_branch": "main"
+            },
+            "sender": {
+              "login": "MuhammadQasimTahir",
+              "id": 155317182,
+              "node_id": "U_kgDOCUHzvg",
+              "avatar_url": "https://avatars.githubusercontent.com/u/155317182?v=4",
+              "gravatar_id": "",
+              "url": "https://api.github.com/users/MuhammadQasimTahir",
+              "html_url": "https://github.com/MuhammadQasimTahir",
+              "followers_url": "https://api.github.com/users/MuhammadQasimTahir/followers",
+              "following_url": "https://api.github.com/users/MuhammadQasimTahir/following{/other_user}",
+              "gists_url": "https://api.github.com/users/MuhammadQasimTahir/gists{/gist_id}",
+              "starred_url": "https://api.github.com/users/MuhammadQasimTahir/starred{/owner}{/repo}",
+              "subscriptions_url": "https://api.github.com/users/MuhammadQasimTahir/subscriptions",
+              "organizations_url": "https://api.github.com/users/MuhammadQasimTahir/orgs",
+              "repos_url": "https://api.github.com/users/MuhammadQasimTahir/repos",
+              "events_url": "https://api.github.com/users/MuhammadQasimTahir/events{/privacy}",
+              "received_events_url": "https://api.github.com/users/MuhammadQasimTahir/received_events",
+              "type": "User",
+              "user_view_type": "public",
+              "site_admin": false
+            }
+          }
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Is failed run?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is failed run?": {
+      "main": [
+        [
+          {
+            "node": "Get jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get jobs": {
+      "main": [
+        [
+          {
+            "node": "Find failed job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find failed job": {
+      "main": [
+        [
+          {
+            "node": "Get job log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get job log": {
+      "main": [
+        [
+          {
+            "node": "Download log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download log": {
+      "main": [
+        [
+          {
+            "node": "Trim log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Diagnose (AI Agent)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "get_file_contents": {
+      "ai_tool": [
+        [
+          {
+            "node": "Diagnose (AI Agent)",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "list_repo_files": {
+      "ai_tool": [
+        [
+          {
+            "node": "Diagnose (AI Agent)",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "list_recent_commits": {
+      "ai_tool": [
+        [
+          {
+            "node": "Diagnose (AI Agent)",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trim log": {
+      "main": [
+        [
+          {
+            "node": "Diagnose (AI Agent)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Diagnose (AI Agent)": {
+      "main": [
+        [
+          {
+            "node": "Parse diagnosis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare fix": {
+      "main": [
+        [
+          {
+            "node": "Get base ref",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get base ref": {
+      "main": [
+        [
+          {
+            "node": "Create branch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create branch": {
+      "main": [
+        [
+          {
+            "node": "Get file (fresh sha)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get file (fresh sha)": {
+      "main": [
+        [
+          {
+            "node": "Apply patch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply patch": {
+      "main": [
+        [
+          {
+            "node": "Commit file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Commit file": {
+      "main": [
+        [
+          {
+            "node": "Open PR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse diagnosis": {
+      "main": [
+        [
+          {
+            "node": "Prepare fix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack approval": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Merge PR",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Close PR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge PR": {
+      "main": [
+        [
+          {
+            "node": "Delete branch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Close PR": {
+      "main": [
+        [
+          {
+            "node": "Delete branch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete branch": {
+      "main": [
+        [
+          {
+            "node": "Build audit row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build audit row": {
+      "main": [
+        [
+          {
+            "node": "Log incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log incident": {
+      "main": [
+        [
+          {
+            "node": "Notify result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open PR": {
+      "main": [
+        [
+          {
+            "node": "Slack approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "errorWorkflow": "zRHr2R65LgZt5faq",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "920a430e-f858-4a05-8f1e-711f132d7112",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "39a382882a26e45fd58e87f5a4d619be17a177ce7e2ff51640194fec74d8541b"
+  },
+  "nodeGroups": [],
+  "id": "UjU1hQ8NEjBhHcYj",
+  "tags": []
+}
