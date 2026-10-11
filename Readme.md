@@ -2,7 +2,6 @@
 
 When a GitHub Actions build fails, an n8n workflow fetches the failing log, trims it to the actual error, and sends it to a Gemini agent. The agent reads the repository's code, works out the root cause, and drafts a minimal fix. The workflow then opens a pull request with a root-cause analysis (RCA) and asks a human in Slack to approve or reject it. **Nothing is merged without that Slack approval.** Every incident is recorded in a Postgres audit table.
 
-> 🎥 **Demo:** _add your screen-recording link here_
 
 ---
 
