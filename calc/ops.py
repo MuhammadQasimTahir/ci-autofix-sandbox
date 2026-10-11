@@ -7,4 +7,4 @@ def div(a, b):
     return a / b
 
 def average(nums):
-    return max(nums)
+    return sum(nums) / len(nums)
