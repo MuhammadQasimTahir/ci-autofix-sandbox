@@ -55,8 +55,8 @@ calc/ops.py                      Small codebase with known-bug targets
 tests/test_ops.py                Test suite the agent fixes against
 n8n/ci-autofix.json              Main workflow (export)
 n8n/ci-autofix-error-alert.json  Error-alert workflow (export)
-scripts/start_n8n.bat            Starts Postgres + n8n + ngrok (Windows)
-sql/create_audit_table.sql       Audit table schema
+scripts/start_n8n.bat            Starts Postgres + n8n + ngrok (Windows; fill in the placeholders)
+sql/create_audit_table.sql       Audit table schema (no data, no secrets)
 .env.example                     The secrets the setup needs (values stay in n8n)
 ```
 
@@ -66,7 +66,7 @@ sql/create_audit_table.sql       Audit table schema
 
 1. **Repository and CI.** Fork or clone this repo. Actions runs `ci.yml` on every push to `main` and on every PR.
 2. **GitHub PAT.** Create a fine-grained token limited to this repo with these permissions: *Actions: read, Contents: read/write, Pull requests: read/write*.
-3. **Start the stack.** Set `NGROK_DOMAIN` and `PG_PASSWORD` in `scripts/start_n8n.bat`, then run it. It starts `ci-audit-db` (Postgres), `n8n`, and the ngrok tunnel. `WEBHOOK_URL` is set to `http://localhost:5678/`, so the Slack Approve and Reject links go directly to n8n on this machine and are never exposed through the tunnel. Only GitHub's webhook uses the public ngrok URL.
+3. **Start the stack.** Open `scripts/start_n8n.bat` and replace the two placeholders at the top: `NGROK_DOMAIN=your-domain.ngrok-free.dev` becomes your static ngrok domain, and `PG_PASSWORD=change-me` becomes a password of your choice. Keep this filled-in copy local and never commit it. Then run it. It starts `ci-audit-db` (Postgres), `n8n`, and the ngrok tunnel. `WEBHOOK_URL` is set to `http://localhost:5678/`, so the Slack Approve and Reject links go directly to n8n on this machine and are never exposed through the tunnel. Only GitHub's webhook uses the public ngrok URL.
 4. **Create the audit table.**
    ```
    docker exec -it ci-audit-db psql -U n8n -d ci_audit
@@ -77,7 +77,7 @@ sql/create_audit_table.sql       Audit table schema
    - **GitHub API:** your PAT.
    - **Google Gemini (PaLM) API:** your AI Studio key.
    - **Slack API:** the `xoxb-` bot token.
-   - **Postgres:** host `host.docker.internal`, port `5432`, database `ci_audit`, user `n8n`, SSL disabled.
+   - **Postgres:** host `host.docker.internal`, port `5432`, database `ci_audit`, user `n8n`, password = the `PG_PASSWORD` you set in step 3, SSL disabled.
 7. **Import the workflows.** Import `n8n/ci-autofix-error-alert.json` and `n8n/ci-autofix.json`, attach the credentials to each node, and choose `#ci-autofix` as the Slack channel. In the main workflow, open *Settings* and set *Error Workflow* to **CI Autofix - Error Alert**. Then **Publish** both workflows.
 8. **Webhook.** In the repo, go to *Settings → Webhooks → Add webhook*. Set the Payload URL to `https://<NGROK_DOMAIN>/webhook/ci-failure`, the content type to `application/json`, and select the **Workflow runs** event only.
 
@@ -109,6 +109,7 @@ FROM ci_incidents ORDER BY id;
 | 5 | `div` returned `a * b` | One-line source fix (PR #5) | **Rejected in Slack**, PR closed, audited (59 s) |
 | 6 | Failing PR from `autofix/loop-test` | None (filtered out) | Loop guard stopped it in 37 ms |
 | 7 | `add` bug plus a test that prints a fake `sk-...` API key | One-line fix (PR #7). The log showed `API_KEY=[REDACTED_API_KEY]` | Key never reached the LLM, Slack or the PR. Merged |
+| 8 | `add` returned `a * b` (full end-to-end run with approval on `localhost`) | One-line fix (PR #8); the PR's own CI passed before merge | **Approved and merged 92 s after the failure**, then CI went green on `main` |
 
 ## Known limitations and future work
 
@@ -118,6 +119,7 @@ FROM ci_incidents ORDER BY id;
 - **Approval does not yet require the PR's own CI to pass.** The *Checks* tab shows the result, but merge-on-approve could also wait for `CI / test (pull_request)` to go green first.
 - **Approval waits have no time limit.** A timeout could auto-close stale PRs.
 - **Approvals happen on the host machine.** The Approve and Reject links point to `localhost`. This keeps them private and avoids ngrok's free-plan browser warning page. To approve from another device, set `WEBHOOK_URL` to a public URL that has no warning page (for example, Tailscale Funnel or a paid ngrok plan).
+- **The webhook isn't signed.** The workflow doesn't yet verify GitHub's `X-Hub-Signature-256`. The PAT is scoped to one repo, so a forged payload can only make the workflow fail, but adding a webhook secret and checking it in n8n would close that gap.
 - **Free-tier limits.** The Gemini free tier returns 429 and 503 errors under load.
 
 ---
