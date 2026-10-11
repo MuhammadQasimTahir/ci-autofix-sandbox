@@ -1,0 +1,72 @@
+{
+  "name": "CI Autofix - Error Alert",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "0a8021a1-503b-444d-a46b-b5b1e9f38af5",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -320,
+        -48
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "#ci-autofix"
+        },
+        "text": "=:warning: *CI Autofix workflow failed* at node `{{ $json.execution.lastNodeExecuted }}`\n> {{ $json.execution.error.message }}\nNo PR was merged. <{{ $json.execution.url }}|Open the failed execution> to investigate.",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "9f624f16-bd93-4da6-ad82-b6135fb372eb",
+      "name": "Alert Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        -80,
+        -48
+      ],
+      "webhookId": "e1a1cccc-0000-4000-8000-0000000000cc",
+      "credentials": {
+        "slackApi": {
+          "id": "xpxcEJdLgg284Lcl",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Alert Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "855fdc91-6520-44a6-9654-c35582986dc5",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "39a382882a26e45fd58e87f5a4d619be17a177ce7e2ff51640194fec74d8541b"
+  },
+  "nodeGroups": [],
+  "id": "zRHr2R65LgZt5faq",
+  "tags": []
+}
